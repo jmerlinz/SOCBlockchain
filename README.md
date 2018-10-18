@@ -1,3 +1,2 @@
-# SOCBlockchain
-Soc Blockchain Research
-Test Rong Ma (will delet later)
+# DSES
+Prototype design of Decentralized Service Eco-System (DSES)
