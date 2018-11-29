@@ -1,56 +1,62 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"math/big"
 	"strconv"
+	"time"
 
 	"github.com/inklabsfoundation/inkchain/core/chaincode/shim"
 	pb "github.com/inklabsfoundation/inkchain/protos/peer"
-	"encoding/json"
-	"time"
-	"math/big"
-	"bytes"
 )
 
 // Incentive-related const
 const (
-	IncentiveBalanceType 	= "INK"
-	IncentiveMashupInvoke	= "10"
+	IncentiveBalanceType  = "INK"
+	IncentiveMashupInvoke = "10"
 )
 
 // Definitions of a service's status
 const (
-	S_Created = "created"
+	S_Created   = "created"
 	S_Available = "available"
-	S_Invalid = "invalid"
+	S_Invalid   = "invalid"
 )
 
 // Prefixes for user and service separately
 const (
-	UserPrefix	= "USER_"
-	ServicePrefix	= "SER_"
+	UserPrefix    = "USER_"
+	ServicePrefix = "SER_"
 )
 
 // Invoke functions definition
 const (
 	// User-related basic invoke
-	RegisterUser 	= "registerUser"
-	RemoveUser 		= "removeUser"
-	QueryUser		= "queryUser"
+	RegisterUser = "registerUser"
+	RemoveUser   = "removeUser"
+	QueryUser    = "queryUser"
 
 	// Service-related invoke
-	RegisterService 	= "registerService"
-	InvalidateService 	= "invalidateService"	// mark whether the service is validated
-	PublishService		= "publishService"		// publish a created service
-	CreateMashup 		= "createMashup"		// utilize services to create a new mashup
-	QueryService		= "queryService"
-	EditService			= "editService"
-	QueryServiceByUser	= "queryServiceByUser"
-	QueryServiceByRange	= "queryServiceByRange"
+	RegisterService     = "registerService"
+	InitAccount         = "initAccount"
+	InvalidateService   = "invalidateService" // mark whether the service is validated
+	PublishService      = "publishService"    // publish a created service
+	CreateMashup        = "createMashup"      // utilize services to create a new mashup
+	QueryService        = "queryService"
+	EditService         = "editService"
+	QueryServiceByUser  = "queryServiceByUser"
+	QueryServiceByRange = "queryServiceByRange"
+	GivesToken          = "givesToken"
+	InvokeService       = "invokeService"
 
 	// User-related reward invoke
 	RewardService = "rewardService"
 
+	Created    string = "created"
+	Delivered  string = "issued"
+	Invalidate string = "invalidated"
 )
 
 // Chaincode for DSES (Decentralized Service Eco-System)
@@ -59,13 +65,14 @@ type serviceChaincode struct {
 
 // Structure definition for user
 type user struct {
-	Name 			string	`json:"name"`
-	Introduction	string	`json:"introduction"`
-	Address 		string 	`json:"address"`
+	Name         string `json:"name"`
+	Introduction string `json:"introduction"`
+	Address      string `json:"address"`
 	// There is a one-to-one correspondence between "Name" and "Address"
 	// The Address records the user's profit from creating valuable services or mashups.
 
-	Contribution	int		`json:"contribution"`
+	Contribution   int `json:"contribution"`
+	DeveloperToken int `json:"developerToken"`
 	// "Contribution" evaluates the user's contribution to the service ecosystem.
 	// TODO: add handler about "Contribution"
 	// Benefit of "Contribution":
@@ -74,27 +81,41 @@ type user struct {
 
 }
 
+// type GenAccount
+type Token struct {
+	// token name
+	Name string `json:"tokenName"`
+	// total supply of the token
+	totalSupply *big.Int `json:"totalSupply"`
+	// initial address to issue
+	Address string `json:"address"`
+	// token status : Created, Delivered, Invalidate
+	Status string `json:"status"`
+	// token decimals
+	Decimals int `json:"decimals"`
+}
+
 // Structure definition for service
 // type "service" defines conventional services as well as mashups.
 type service struct {
-	Name 			string	`json:"name"`
-	Type			string  `json:"type"`
-	Developer		string	`json:"developer"`		// record the user that developed this service
-	Description		string 	`json:"description"`
+	Name        string `json:"name"`
+	Type        string `json:"type"`
+	Developer   string `json:"developer"` // record the user that developed this service
+	Description string `json:"description"`
 
-	CreatedTime		string	`json:"createdTime"`
-	UpdatedTime		string	`json:"updatedTime"`
+	CreatedTime string `json:"createdTime"`
+	UpdatedTime string `json:"updatedTime"`
 
 	// Status records the status of a service:
 	// created/available/invalid
-	Status			string 	`json:"status"`
+	Status string `json:"status"`
 
 	// Whether the service is a mashup or not.
-	IsMashup		bool 	`json:"isMashup"`
+	IsMashup bool `json:"isMashup"`
 
 	// if the service is a mashup, "Composited" records the services that it invokes;
 	// if the service is not a mashup, "Composited" records the co-occurrence documents of the service
-	Composition		map[string]int	`json:"composition"`
+	Composition map[string]int `json:"composition"`
 
 	// Benefit of "Composited":
 	// 1. Automatically create service co-occurrence documents and store it into the ledger
@@ -150,6 +171,13 @@ func (t *serviceChaincode) Invoke(stub shim.ChaincodeStubInterface) pb.Response 
 		// args[0]: user name
 		return t.queryUser(stub, args)
 
+	case InitAccount:
+		if len(args) != 4 {
+			return shim.Error("Incorrect number of arguments. Expecting 4.")
+		}
+		// args[0]: user name
+		return t.initAccount(stub, args)
+
 	// ********************************************************
 	// PART 2: service-related invokes
 	case RegisterService:
@@ -203,7 +231,7 @@ func (t *serviceChaincode) Invoke(stub shim.ChaincodeStubInterface) pb.Response 
 		return t.createMashup(stub, args)
 
 	case QueryServiceByRange:
-		if len(args) !=2 {
+		if len(args) != 2 {
 			return shim.Error("Incorrect number of arguments. Expecting 2.")
 		}
 		// args[0]: begin index
@@ -220,6 +248,24 @@ func (t *serviceChaincode) Invoke(stub shim.ChaincodeStubInterface) pb.Response 
 		// args[1]: reward_type
 		// args[2]: reward_amount
 		return t.rewardService(stub, args)
+
+	case GivesToken:
+		if len(args) < 2 {
+			return shim.Error("Incorrect number of arguments. Expecting 2 at least.")
+		}
+		// args[0]: service name
+		// args[1]: reward_type
+		// args[2]: reward_amount
+		return t.givesToken(stub, args)
+
+	case InvokeService:
+		if len(args) < 2 {
+			return shim.Error("Incorrect number of arguments. Expecting 2 at least.")
+		}
+		// args[0]: service name
+		// args[1]: reward_type
+		// args[2]: reward_amount
+		return t.invokeService(stub, args)
 	}
 
 	return shim.Error("Invalid invoke function name.")
@@ -256,7 +302,7 @@ func (t *serviceChaincode) registerUser(stub shim.ChaincodeStubInterface, args [
 	}
 
 	// register user
-	user := &user{new_name, new_intro, new_add, 0}
+	user := &user{new_name, new_intro, new_add, 0, 0}
 	userJSONasBytes, err := json.Marshal(user)
 	if err != nil {
 		return shim.Error(err.Error())
@@ -266,7 +312,212 @@ func (t *serviceChaincode) registerUser(stub shim.ChaincodeStubInterface, args [
 		return shim.Error(err.Error())
 	}
 
-	return shim.Success([]byte("User register success."))
+	return shim.Success([]byte("User register & Init account success."))
+}
+
+// ==================================
+// initAccount: Initate token for new user accounr
+// ==================================
+func (t *serviceChaincode) initAccount(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	// var A string           // Address
+	// var BalanceType string // Token type
+
+	// var err error
+
+	// tokenName := args[1]
+
+	// A = strings.ToLower(args[0])
+	// BalanceType = args[1]
+
+	// source_add, err = stub.GetSender()
+	// if err != nil {
+	// 	return shim.Error("Fail to get the sender's address.")
+	// }
+
+	// // Get the state from the ledger
+	// account, err := stub.GetAccount(A)
+	// if err != nil {
+	// 	jsonResp := "{\"Error\":\"account not exists\"}"
+	// 	return shim.Error(jsonResp)
+	// }
+
+	// if account == nil {
+	// 	jsonResp := "{\"Error\":\"Nil amount for " + A + "\"}"
+	// 	return shim.Error(jsonResp)
+	// }
+	// balanceJson, jsonErr := json.Marshal(account.Balance)
+	// if jsonErr != nil {
+	// 	return shim.Error(jsonErr.Error())
+	// }
+
+	// // Amount
+	// amount := big.NewInt(0)
+	// _, good := amount.SetString("100", 10)
+	// if !good {
+	// 	return shim.Error("Expecting integer value for amount")
+	// }
+
+	// //Get exist token
+	// var existToken Token
+	// existTokenBytes, err := stub.GetState(tokenName)
+	// if err != nil {
+	// 	msgCheck := "Check token existance error, fail to getState of "
+	// 	msgCheck += tokenName
+	// 	// tralogger.Debug(msgCheck)
+	// 	return shim.Error(msgCheck)
+	// }
+
+	// //Get the information of token
+	// //If not exist, create a new token first
+	// if existTokenBytes == nil {
+	// 	//not exist
+	// 	//create the token
+	// 	existToken.Status = Created
+	// 	existToken.Name = tokenName
+	// 	existToken.totalSupply = amount
+	// 	existToken.Address = A
+	// 	existToken.Decimals = 10
+	// } else {
+	// 	//exist
+	// 	//unmarshal the jsonBytes & check token information
+	// 	err = json.Unmarshal(existTokenBytes, &existToken)
+	// 	if err != nil {
+	// 		msgUnmarshal := "Unmarshal exist tokenBytes err "
+	// 		msgUnmarshal += tokenName
+	// 		// tralogger.Debug(msgUnmarshal)
+	// 		return shim.Error(msgUnmarshal)
+	// 	}
+	// 	//check the status of token
+	// 	if existToken.Status != Created {
+	// 		msgCheckTS := "Token status err, fail to issue token."
+	// 		// tralogger.Debug(msgCheckTS)
+	// 		return shim.Error(msgCheckTS)
+	// 	}
+	// 	//check the information of token
+	// 	if existToken.Address != A || existToken.totalSupply.Cmp(amount) != 0 || existToken.Decimals != 10 {
+	// 		msgCheckTInfo := "Token info err, check fialed."
+	// 		// tralogger.Debug(msgCheckTInfo)
+	// 		return shim.Error(msgCheckTInfo)
+	// 	}
+	// }
+
+	// err = stub.IssueToken(A, BalanceType, amount)
+	// // if err != nil {
+	// // 	return shim.Error("transfer error" + err.Error())
+	// // }
+	// if err != nil {
+	// 	return shim.Error(err.Error())
+	// }
+
+	// existToken.Status = Delivered
+
+	// //store the latest status for token in ascc
+	// existTokenJson, err := json.Marshal(&existToken)
+	// err = stub.PutState(tokenName, existTokenJson)
+
+	// if err != nil {
+	// 	msgUpdate := "Store the latest token status err."
+	// 	// tralogger.Debug(msgUpdate)
+	// 	return shim.Error(msgUpdate)
+	// }
+
+	// jsonResp := "{\"Name\":\"" + A + "\",\"Balance\":\"" + string(balanceJson[:]) + "\"}"
+	// return shim.Success([]byte(jsonResp))
+	var err error
+
+	tokenName := args[0]
+
+	totalSupply := big.NewInt(0)
+	_, good := totalSupply.SetString(args[1], 10)
+	if !good {
+		return shim.Error("Expecting integer value for totalSupply.")
+	}
+	dec, _ := strconv.Atoi(args[2])
+	addr := args[3]
+
+	//Get exist token
+	var existToken Token
+	// var existTokenBytes []byte
+	existTokenBytes, err := stub.GetState(tokenName)
+	if err != nil {
+		msgCheck := "Check token existance error, fail to getState of "
+		msgCheck += tokenName
+		// tralogger.Debug(msgCheck)
+		return shim.Error(msgCheck)
+	}
+
+	//Get the information of token
+	//If not exist, create a new token first
+	if existTokenBytes == nil {
+		//not exist
+		//create the token
+		existToken.Status = Created
+		existToken.Name = tokenName
+		existToken.totalSupply = totalSupply
+		existToken.Address = addr
+		existToken.Decimals = dec
+	} else {
+		//exist
+		//unmarshal the jsonBytes & check token information
+		err = json.Unmarshal(existTokenBytes, &existToken)
+		if err != nil {
+			msgUnmarshal := "Unmarshal exist tokenBytes err "
+			msgUnmarshal += tokenName
+			// tralogger.Debug(msgUnmarshal)
+			return shim.Error(msgUnmarshal)
+		}
+		//check the status of token
+		if existToken.Status != Created {
+			msgCheckTS := "Token status err, fail to issue token."
+			// tralogger.Debug(msgCheckTS)
+			return shim.Error(msgCheckTS)
+		}
+		//check the information of token
+		// || existToken.Decimals != dec
+		if existToken.Address != addr || existToken.totalSupply.Cmp(totalSupply) != 0 {
+			msgCheckTInfo := "Token info err, check fialed."
+			// tralogger.Debug(msgCheckTInfo)
+			return shim.Error(msgCheckTInfo)
+		}
+	}
+
+	//set the token number to address
+
+	//get account of Address
+
+	// account, err := stub.GetAccount(addr)
+	// //check if token has been issued before
+	// if err == nil {
+	// 	if account != nil {
+	// 		if _, ok := account.Balance[tokenName]; ok {
+	// 			msgBalanceCheck := "Token " + tokenName + " already exist in " + addr
+	// 			// tralogger.Debug(msgBalanceCheck)
+	// 			return shim.Error(msgBalanceCheck)
+	// 		}
+	// 	}
+	// }
+	//token hasnot been issued, then
+	//issue token
+	err = stub.Transfer(addr, tokenName, totalSupply)
+	if err != nil {
+		return shim.Error("DSES" + err.Error())
+	}
+
+	// existToken.Status = Delivered
+
+	//store the latest status for token in ascc
+	existTokenJson, err := json.Marshal(&existToken)
+	err = stub.PutState(tokenName, existTokenJson)
+
+	if err != nil {
+		msgUpdate := "Store the latest token status err."
+		// tralogger.Debug(msgUpdate)
+		return shim.Error(msgUpdate)
+	}
+	// jsonResp := "{\"Name\":\"" + A + "\",\"Balance\":\"" + string(balanceJson[:]) + "\"}"
+	// return shim.Success([]byte(jsonResp))
+	return shim.Success([]byte("Token issued success!"))
+
 }
 
 // ===================================
@@ -326,8 +577,8 @@ func (t *serviceChaincode) queryUser(stub shim.ChaincodeStubInterface, args []st
 func (t *serviceChaincode) registerService(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	var service_name string
 	var service_type string
-	var service_des  string
-	var service_dev  string
+	var service_des string
+	var service_dev string
 	var user_name string
 	var err error
 
@@ -355,6 +606,18 @@ func (t *serviceChaincode) registerService(stub shim.ChaincodeStubInterface, arg
 		return shim.Error("Not the correct user.")
 	}
 
+	// update developerToken user
+	newtoken := userJSON.DeveloperToken + 1
+	user := &user{userJSON.Name, userJSON.Introduction, userJSON.Address, userJSON.Contribution, newtoken}
+	userJSONasBytes, err := json.Marshal(user)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	err = stub.PutState(user_key, userJSONasBytes)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
 	// check if service exists
 	service_key := ServicePrefix + service_name
 	serviceAsBytes, err := stub.GetState(service_key)
@@ -380,6 +643,11 @@ func (t *serviceChaincode) registerService(stub shim.ChaincodeStubInterface, arg
 	if err != nil {
 		return shim.Error(err.Error())
 	}
+
+	// result := givesToken(stub, user_name, "INK", "100")
+	// if result != "Ok" {
+	// 	return shim.Error("err.Error()")
+	// }
 
 	return shim.Success([]byte("Service register success."))
 }
@@ -433,8 +701,8 @@ func (t *serviceChaincode) invalidateService(stub shim.ChaincodeStubInterface, a
 	// STEP 2: invalidate the service and store it.
 	// new service, make it invalidated
 	new_service := &service{serviceJSON.Name, serviceJSON.Type, serviceJSON.Developer,
-							serviceJSON.Description, serviceJSON.CreatedTime, serviceJSON.UpdatedTime,
-							S_Invalid, serviceJSON.IsMashup, serviceJSON.Composition}
+		serviceJSON.Description, serviceJSON.CreatedTime, serviceJSON.UpdatedTime,
+		S_Invalid, serviceJSON.IsMashup, serviceJSON.Composition}
 	// store the new service
 	assetJSONasBytes, err := json.Marshal(new_service)
 	if err != nil {
@@ -594,8 +862,8 @@ func (t *serviceChaincode) editService(stub shim.ChaincodeStubInterface, args []
 	tString := tNow.UTC().Format(time.UnixDate)
 
 	new_service := &service{serviceJSON.Name, serviceJSON.Type, serviceJSON.Developer,
-							serviceJSON.Description, serviceJSON.CreatedTime, tString,
-							 serviceJSON.Status, serviceJSON.IsMashup, serviceJSON.Composition}
+		serviceJSON.Description, serviceJSON.CreatedTime, tString,
+		serviceJSON.Status, serviceJSON.IsMashup, serviceJSON.Composition}
 
 	// STEP 3: update field value
 	// developer can update service's type/description information
@@ -632,8 +900,8 @@ LABEL_STORE:
 func (t *serviceChaincode) createMashup(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	var mashup_name string
 	var mashup_type string
-	var mashup_des  string
-	var mashup_dev  string
+	var mashup_des string
+	var mashup_dev string
 	var err error
 
 	mashup_name = args[0]
@@ -663,7 +931,7 @@ func (t *serviceChaincode) createMashup(stub shim.ChaincodeStubInterface, args [
 	// create composition
 	new_map := make(map[string]int)
 	new_developer_map := make(map[string]int)
-	for i:= 3; i<len(args);i++ {
+	for i := 3; i < len(args); i++ {
 		// check the service exist
 		service_key := ServicePrefix + args[i]
 		serviceAsBytes, err := stub.GetState(service_key)
@@ -695,7 +963,7 @@ func (t *serviceChaincode) createMashup(stub shim.ChaincodeStubInterface, args [
 	incentive_amount := big.NewInt(0)
 	incentive_amount.SetString(IncentiveMashupInvoke, 10)
 
-	for k,_ := range(new_developer_map) {
+	for k, _ := range new_developer_map {
 		// get the k's address
 		user_key := UserPrefix + k
 		userAsBytes, err := stub.GetState(user_key)
@@ -714,6 +982,18 @@ func (t *serviceChaincode) createMashup(stub shim.ChaincodeStubInterface, args [
 		err = stub.Transfer(userJSON.Address, IncentiveBalanceType, incentive_amount)
 		if err != nil {
 			return shim.Error("Error when making transfer.")
+		}
+
+		// update developerToken user
+		newtoken := userJSON.DeveloperToken + 1
+		user := &user{userJSON.Name, userJSON.Introduction, userJSON.Address, userJSON.Contribution, newtoken}
+		userJSONasBytes, err := json.Marshal(user)
+		if err != nil {
+			return shim.Error(err.Error())
+		}
+		err = stub.PutState(user_key, userJSONasBytes)
+		if err != nil {
+			return shim.Error(err.Error())
 		}
 	}
 
@@ -784,6 +1064,18 @@ func (t *serviceChaincode) rewardService(stub shim.ChaincodeStubInterface, args 
 		return shim.Error("Fail realize the reawrd.")
 	}
 
+	// update developerToken user
+	newtoken := userJSON.DeveloperToken + 1
+	user := &user{userJSON.Name, userJSON.Introduction, userJSON.Address, userJSON.Contribution, newtoken}
+	userJSONasBytes, err := json.Marshal(user)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	err = stub.PutState(user_key, userJSONasBytes)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
 	return shim.Success([]byte("Reward the service success."))
 }
 
@@ -815,27 +1107,161 @@ func (t *serviceChaincode) queryServiceByRange(stub shim.ChaincodeStubInterface,
 		if err != nil {
 			return shim.Error(err.Error())
 		}
-			// Add a comma before array members, suppress it for the first array member
-			if bArrayMemberAlreadyWritten == true {
-				buffer.WriteString(",")
-			}
-			// index of the result
-			buffer.WriteString("{\"Number\":")
-			buffer.WriteString("\"")
-			bArrayIndexStr := strconv.Itoa(bArrayIndex)
-			buffer.WriteString(string(bArrayIndexStr))
-			bArrayIndex += 1
-			buffer.WriteString("\"")
-			// information about current asset
-			buffer.WriteString(", \"Record\":")
-			buffer.WriteString(string(queryResponse.Value))
-			buffer.WriteString("}")
-			bArrayMemberAlreadyWritten = true
-
+		// Add a comma before array members, suppress it for the first array member
+		if bArrayMemberAlreadyWritten == true {
+			buffer.WriteString(",")
+		}
+		// index of the result
+		buffer.WriteString("{\"Number\":")
+		buffer.WriteString("\"")
+		bArrayIndexStr := strconv.Itoa(bArrayIndex)
+		buffer.WriteString(string(bArrayIndexStr))
+		bArrayIndex += 1
+		buffer.WriteString("\"")
+		// information about current asset
+		buffer.WriteString(", \"Record\":")
+		buffer.WriteString(string(queryResponse.Value))
+		buffer.WriteString("}")
+		bArrayMemberAlreadyWritten = true
 
 	}
 	buffer.WriteString("]")
 
 	return shim.Success(buffer.Bytes())
 
+}
+
+// =======================================================
+// givesToken: reward a service
+// reward a service's developer, transfer fixed amount of
+// specific reward_type token to the developer's account.
+// =======================================================
+func (t *serviceChaincode) invokeService(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	var service_name string
+	service_name = args[0]
+	//get developer from service name
+	service_key := ServicePrefix + service_name
+	serviceAsBytes, err := stub.GetState(service_key)
+	if err != nil {
+		return shim.Error("Fail to get the service's info.")
+	}
+
+	var serviceJSON service
+	err = json.Unmarshal([]byte(serviceAsBytes), &serviceJSON)
+	if err != nil {
+		return shim.Error("Error unmarshal service bytes.")
+	}
+
+	dev := serviceJSON.Developer
+
+	// STEP 1: get the address of the dev
+	user_key := UserPrefix + dev
+	userAsBytes, err := stub.GetState(user_key)
+	if err != nil {
+		return shim.Error("Fail to get the developer's info.")
+	}
+	var userJSON user
+	err = json.Unmarshal([]byte(userAsBytes), &userJSON)
+	if err != nil {
+		return shim.Error("Error unmarshal user bytes.")
+	}
+
+	// update developerToken user
+	newtoken := userJSON.DeveloperToken + 2
+	user := &user{userJSON.Name, userJSON.Introduction, userJSON.Address, userJSON.Contribution, newtoken}
+	userJSONasBytes, err := json.Marshal(user)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	err = stub.PutState(user_key, userJSONasBytes)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
+	return shim.Success([]byte("Reward the service success."))
+	// return "Ok"
+}
+
+// =======================================================
+// givesToken: reward a service
+// reward a service's developer, transfer fixed amount of
+// specific reward_type token to the developer's account.
+// =======================================================
+func (t *serviceChaincode) givesToken(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	var reward_type string
+	var userName string
+	var incentive_type string
+	var amount string
+	var err error
+
+	reward_type = args[0]
+	userName = args[1]
+	incentive_type = args[2]
+
+	switch incentive_type {
+	// ************************ Developers token ***********************
+	// register service
+	case "1":
+		amount = "110"
+		break
+	// register mashup
+	case "2":
+		amount = "110"
+		break
+	// service is invoked
+	case "3":
+		amount = "110"
+		break
+	// user gives token to service provider
+	case "4":
+		amount = "110"
+		break
+
+	// ************************ Users token ***********************
+	// register user
+	case "5":
+		amount = "510"
+		break
+	// comments
+	case "6":
+		amount = "110"
+		break
+	// thumbps up/down (every 10)
+	case "7":
+		amount = "110"
+		break
+
+	}
+	// Amount
+	reward_amount := big.NewInt(0)
+	_, good := reward_amount.SetString(amount, 10)
+	if !good {
+		return shim.Error("Expecting integer value for amount")
+		// return "Error"
+	}
+
+	// STEP 1: get the address of the dev
+	user_key := UserPrefix + userName
+	userAsBytes, err := stub.GetState(user_key)
+	if err != nil {
+		return shim.Error("Fail to get the developer's info.")
+		// return "Error"
+	}
+	var userJSON user
+	err = json.Unmarshal([]byte(userAsBytes), &userJSON)
+	if err != nil {
+		return shim.Error("Error unmarshal user bytes.")
+		// return "Error"
+	}
+
+	// STEP 3: reward the developer
+	toAdd := userJSON.Address
+	err = stub.Transfer(toAdd, reward_type, reward_amount)
+	if err != nil {
+		return shim.Error("Fail realize the reawrd.")
+		// return "Error"
+	}
+
+	return shim.Success([]byte("Reward the service success."))
+	// return "Ok"
 }
